@@ -147,7 +147,7 @@ class UnifiedVoice(nn.Module):
             tensor_parallel_size=1,
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
-            enforce_eager=True,
+            # enforce_eager=True,
         )
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
         self.sampling_params = SamplingParams(
@@ -155,7 +155,8 @@ class UnifiedVoice(nn.Module):
             top_p=0.8,
             top_k=30,  # 5, 30
             repetition_penalty=10.0,  # 8.0
-            max_tokens=768,  # 605
+            max_tokens=1500,  # 605
+            stop_token_ids=[self.stop_mel_token]
         )
 
     def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False):

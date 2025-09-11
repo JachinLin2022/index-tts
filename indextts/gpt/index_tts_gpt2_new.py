@@ -459,7 +459,6 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
                 loaded_weight = loaded_weight.t()
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
-            print(name)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

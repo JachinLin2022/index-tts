@@ -466,7 +466,8 @@ class IndexTTS2:
                         max_generate_length=max_mel_tokens,
                         **generation_kwargs
                     )
-
+                print(f"shape of codes: {codes.shape}")
+                print(f"shape of speech_conditioning_latent: {speech_conditioning_latent.shape}")
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
                     warnings.warn(

@@ -39,7 +39,7 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=True, device=None,
-            use_cuda_kernel=None,use_deepspeed=False,gpu_memory_utilization=0.25,
+            use_cuda_kernel=None,use_deepspeed=False,gpu_memory_utilization=0.5,
     ):
         """
         Args:
@@ -459,6 +459,8 @@ class IndexTTS2:
                         num_return_sequences=autoregressive_batch_size
                     )
                 codes = torch.tensor(codes, dtype=torch.long, device=self.device)
+                print(f"shape of codes: {codes.shape}")
+                print(f"shape of speech_conditioning_latent: {speech_conditioning_latent.shape}")
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
                     warnings.warn(
@@ -519,7 +521,6 @@ class IndexTTS2:
                     S_infer = S_infer.transpose(1, 2)
                     S_infer = S_infer + latent
                     target_lengths = (code_lens * 1.72).long()
-
                     cond = self.s2mel.models['length_regulator'](S_infer,
                                                                  ylens=target_lengths,
                                                                  n_quantizers=3,
