@@ -137,6 +137,7 @@ class IndexTTS2:
         self.s2mel = s2mel.to(self.device)
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
         self.s2mel.eval()
+        # self.s2mel = torch.compile(self.s2mel, mode="reduce-overhead", fullgraph=True)
         print(">> s2mel weights restored from:", s2mel_path)
 
         # load campplus_model
@@ -292,6 +293,70 @@ class IndexTTS2:
     def _set_gr_progress(self, value, desc):
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
+
+    
+    
+    def crossfade_torch(self, wavs: list, crossfade_duration_ms: int, sampling_rate: int) -> torch.Tensor:
+        """
+        Applies crossfading to a list of PyTorch audio tensors.
+
+        Args:
+            wavs (list): A list of audio tensors, each with shape [channels, samples].
+            crossfade_duration_ms (int): The duration of the crossfade in milliseconds.
+            sampling_rate (int): The sampling rate of the audio.
+
+        Returns:
+            torch.Tensor: The final audio tensor after concatenation and crossfading.
+        """
+        if not wavs:
+            return torch.tensor([])
+        if len(wavs) == 1:
+            return wavs[0]
+
+        # 1. 计算交叉淡化的样本数
+        fade_samples = int(sampling_rate * crossfade_duration_ms / 1000)
+        
+        # 确保所有张量都在同一设备上
+        device = wavs[0].device
+        
+        # 2. 创建淡入和淡出窗口
+        fade_out_window = torch.linspace(1.0, 0.0, fade_samples, device=device).unsqueeze(0)
+        fade_in_window = torch.linspace(0.0, 1.0, fade_samples, device=device).unsqueeze(0)
+
+        # 3. 循环拼接
+        final_wav = wavs[0]
+        for i in range(1, len(wavs)):
+            wav2 = wavs[i]
+            
+            # 确定实际的重叠长度，防止音频段比淡化区还短
+            overlap_len = min(fade_samples, final_wav.shape[1], wav2.shape[1])
+            
+            if overlap_len == 0: # 如果其中一个片段为空，则直接拼接
+                final_wav = torch.cat([final_wav, wav2], dim=1)
+                continue
+
+            # 获取重叠区域
+            wav1_overlap = final_wav[:, -overlap_len:]
+            wav2_overlap = wav2[:, :overlap_len]
+
+            # 获取非重叠区域
+            wav1_remainder = final_wav[:, :-overlap_len]
+            wav2_remainder = wav2[:, overlap_len:]
+
+            # 如果淡化窗口比实际重叠区长，需要裁剪
+            if overlap_len < fade_samples:
+                fo_win = fade_out_window[:, :overlap_len]
+                fi_win = fade_in_window[:, :overlap_len]
+            else:
+                fo_win, fi_win = fade_out_window, fade_in_window
+                
+            # 应用交叉淡化
+            crossfaded_part = wav1_overlap * fo_win + wav2_overlap * fi_win
+
+            # 拼接成新的 final_wav
+            final_wav = torch.cat([wav1_remainder, crossfaded_part, wav2_remainder], dim=1)
+            
+        return final_wav
 
     # 原始推理模式
     async def infer(self, spk_audio_prompt, text, output_path,
@@ -547,8 +612,11 @@ class IndexTTS2:
                 wavs.append(wav.cpu())  # to cpu before saving
         end_time = time.perf_counter()
         self._set_gr_progress(0.9, "save audio...")
-        wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
-        wav = torch.cat(wavs, dim=1)
+        if interval_silence > 0:
+            wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+        # wav = torch.cat(wavs, dim=1)
+        crossfade_ms = 150
+        wav = self.crossfade_torch(wavs, crossfade_duration_ms=crossfade_ms, sampling_rate=sampling_rate)
         wav_length = wav.shape[-1] / sampling_rate
         print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
         print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
@@ -575,6 +643,282 @@ class IndexTTS2:
             wav_data = wav.type(torch.int16)
             wav_data = wav_data.numpy().T
             return (sampling_rate, wav_data)
+        
+        
+    
+    
+    async def infer_fast(self, spk_audio_prompt, text, output_path,
+                         emo_audio_prompt=None, emo_alpha=1.0,
+                         emo_vector=None,
+                         use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+                         verbose=False, max_text_tokens_per_segment=100,
+                         segments_bucket_max_size=4,
+                         **generation_kwargs):
+        """
+        Args:
+            ``max_text_tokens_per_segment``: 分句的最大token数，默认``100``，可以根据GPU硬件情况调整
+                - 越小，batch 越多，推理速度越*快*，占用内存更多，可能影响质量
+                - 越大，batch 越少，推理速度越*慢*，占用内存和质量更接近于非快速推理
+            ``segments_bucket_max_size``: 分句分桶的最大容量，默认``4``，可以根据GPU内存调整
+                - 越大，bucket数量越少，batch越多，推理速度越*快*，占用内存更多，可能影响质量
+                - 越小，bucket数量越多，batch越少，推理速度越*慢*，占用内存和质量更接近于非快速推理
+        """
+        print(">> start fast inference...")
+        self._set_gr_progress(0, "start fast inference...")
+        if verbose:
+            print(f"origin text:{text}, spk_audio_prompt:{spk_audio_prompt},"
+                  f" emo_audio_prompt:{emo_audio_prompt}, emo_alpha:{emo_alpha}, "
+                  f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
+                  f"emo_text:{emo_text}")
+        start_time = time.perf_counter()
+
+        if use_emo_text:
+            emo_audio_prompt = None
+            emo_alpha = 1.0
+            if emo_text is None:
+                emo_text = text
+            emo_dict = self.qwen_emo.inference(emo_text)
+            print(emo_dict)
+            emo_vector = list(emo_dict.values())
+
+        if emo_vector is not None:
+            emo_audio_prompt = None
+            emo_alpha = 1.0
+
+        if emo_audio_prompt is None:
+            emo_audio_prompt = spk_audio_prompt
+            emo_alpha = 1.0
+
+        # Cache speaker and emotion embeddings
+        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+            audio, sr = librosa.load(spk_audio_prompt)
+            audio = torch.tensor(audio).unsqueeze(0)
+            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+
+            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+            input_features = inputs["input_features"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device), num_mel_bins=80, dither=0,
+                                                     sample_frequency=16000)
+            feat = feat - feat.mean(dim=0, keepdim=True)
+            style = self.campplus_model(feat.unsqueeze(0))
+
+            prompt_condition = self.s2mel.models['length_regulator'](S_ref, ylens=ref_target_lengths, n_quantizers=3,
+                                                                     f0=None)[0]
+
+            self.cache_spk_cond = spk_cond_emb
+            self.cache_s2mel_style = style
+            self.cache_s2mel_prompt = prompt_condition
+            self.cache_spk_audio_prompt = spk_audio_prompt
+            self.cache_mel = ref_mel
+        else:
+            style = self.cache_s2mel_style
+            prompt_condition = self.cache_s2mel_prompt
+            spk_cond_emb = self.cache_spk_cond
+            ref_mel = self.cache_mel
+
+        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+            emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
+            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+            emo_input_features = emo_inputs["input_features"].to(self.device)
+            emo_attention_mask = emo_inputs["attention_mask"].to(self.device)
+            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+            self.cache_emo_cond = emo_cond_emb
+            self.cache_emo_audio_prompt = emo_audio_prompt
+        else:
+            emo_cond_emb = self.cache_emo_cond
+
+        emovec = self.gpt.merge_emovec(
+            spk_cond_emb, emo_cond_emb,
+            torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+            torch.tensor([emo_cond_emb.shape[-1]], device=self.device),
+            alpha=emo_alpha
+        )
+
+        if emo_vector is not None:
+            weight_vector = torch.tensor(emo_vector).to(self.device)
+            if use_random:
+                random_index = [random.randint(0, x - 1) for x in self.emo_num]
+            else:
+                random_index = [find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
+            emo_matrix = [tmp[index].unsqueeze(0) for index, tmp in zip(random_index, self.emo_matrix)]
+            emo_matrix = torch.cat(emo_matrix, 0)
+            emovec_mat = weight_vector.unsqueeze(1) * emo_matrix
+            emovec_mat = torch.sum(emovec_mat, 0).unsqueeze(0)
+            emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
+
+        # Text processing and bucketing
+        self._set_gr_progress(0.1, "text processing...")
+        text_tokens_list = self.tokenizer.tokenize(text)
+        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+        bucket_max_size = segments_bucket_max_size if self.device != "cpu" else 1
+        all_segments = self.bucket_segments(segments, bucket_max_size=bucket_max_size)
+
+        if verbose:
+            print(">> text token count:", len(text_tokens_list))
+            print("   segments count:", len(segments))
+            print("   max_text_tokens_per_segment:", max_text_tokens_per_segment)
+            print(">> segments bucket_count:", len(all_segments),
+                  "bucket sizes:", [(len(s), [t["idx"] for t in s]) for s in all_segments],
+                  "bucket_max_size:", bucket_max_size)
+
+        all_text_tokens = []
+        for bucket in all_segments:
+            temp_tokens = []
+            for item in bucket:
+                text_tokens = self.tokenizer.convert_tokens_to_ids(item["sent"])
+                temp_tokens.append(torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0))
+            all_text_tokens.append(temp_tokens)
+
+        # Inference
+        all_batch_codes = []
+        all_speech_conditioning_latents = []
+        processed_num = 0
+        all_batch_num = sum(len(s) for s in all_segments)
+        gpt_gen_time = 0
+        has_warned = False
+
+        for item_tokens in all_text_tokens:
+            batch_num = len(item_tokens)
+            processed_num += batch_num
+            self._set_gr_progress(0.2 + 0.3 * processed_num / all_batch_num,
+                                  f"gpt inference speech... {processed_num}/{all_batch_num}")
+
+            for text_tokens in item_tokens:
+                m_start_time = time.perf_counter()
+                with torch.no_grad():
+                    with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                        codes, speech_conditioning_latent = await self.gpt.inference_speech_vllm(
+                            spk_cond_emb, text_tokens, emo_cond_emb,
+                            cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                            emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=self.device),
+                            emo_vec=emovec,
+                            num_return_sequences=1
+                        )
+                gpt_gen_time += time.perf_counter() - m_start_time
+
+                codes = torch.tensor(codes, dtype=torch.long, device=self.device)
+                all_batch_codes.append(codes)
+                all_speech_conditioning_latents.append(speech_conditioning_latent)
+
+                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                    warnings.warn(
+                        f"WARN: generation stopped due to exceeding `max_mel_tokens`. "
+                        f"Consider reducing `max_text_tokens_per_segment` or increasing `max_mel_tokens`.",
+                        category=RuntimeWarning
+                    )
+                    has_warned = True
+
+        # Latent generation and vocoder
+        self._set_gr_progress(0.5, "gpt inference latents...")
+        all_latents = []
+        all_idxs = []
+        gpt_forward_time = 0
+
+        for batch_codes, speech_latent, batch_tokens, batch_segments in zip(
+                all_batch_codes, all_speech_conditioning_latents, all_text_tokens, all_segments):
+            for i in range(batch_codes.shape[0]):
+                codes = batch_codes[i].unsqueeze(0)
+                text_tokens = batch_tokens[i]
+                all_idxs.append(batch_segments[i]["idx"])
+
+                code_len = codes.shape[-1]
+                if self.stop_mel_token in codes:
+                    code_len = (codes == self.stop_mel_token).nonzero(as_tuple=False)[0].item()
+                codes = codes[:, :code_len]
+                code_lens = torch.LongTensor([code_len]).to(self.device)
+
+                m_start_time = time.perf_counter()
+                with torch.no_grad():
+                    with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None,
+                                            dtype=self.dtype):
+                        latent = self.gpt(
+                            speech_latent, text_tokens,
+                            torch.tensor([text_tokens.shape[-1]], device=self.device),
+                            codes, code_lens,
+                            emo_cond_emb,
+                            cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                            emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=self.device),
+                            emo_vec=emovec,
+                            use_speed=torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
+                        )
+                gpt_forward_time += time.perf_counter() - m_start_time
+                all_latents.append(latent)
+
+        # S2Mel and BigVGAN
+        self._set_gr_progress(0.7, "s2mel and bigvgan decode...")
+        all_vc_targets = []
+        s2mel_time = 0
+        all_latents_ordered = [all_latents[all_idxs.index(i)] for i in range(len(all_latents))]
+
+        for latent, codes in zip(all_latents_ordered, all_batch_codes):
+            m_start_time = time.perf_counter()
+            with torch.no_grad():
+                with torch.amp.autocast(self.device, enabled=self.dtype is not None, dtype=self.dtype):
+                    latent = self.s2mel.models['gpt_layer'](latent)
+                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1)).transpose(1, 2)
+                    S_infer = S_infer + latent
+                    target_lengths = (torch.LongTensor([codes.shape[-1]]).to(self.device) * 1.72).long()
+
+                    cond = self.s2mel.models['length_regulator'](S_infer, ylens=target_lengths, n_quantizers=3,
+                                                                 f0=None)[0]
+                    cat_condition = torch.cat([prompt_condition, cond], dim=1)
+
+                    vc_target = self.s2mel.models['cfm'].inference(
+                        cat_condition, torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                        ref_mel, style, None, 25, inference_cfg_rate=0.7
+                    )
+                    vc_target = vc_target[:, :, ref_mel.size(-1):]
+                    all_vc_targets.append(vc_target)
+            s2mel_time += time.perf_counter() - m_start_time
+
+        wavs = []
+        bigvgan_time = 0
+        chunk_size = 2
+        chunk_latents = [all_vc_targets[i: i + chunk_size] for i in range(0, len(all_vc_targets), chunk_size)]
+
+        for items in chunk_latents:
+            latent_chunk = torch.cat(items, dim=2)
+            with torch.no_grad():
+                with torch.amp.autocast(latent_chunk.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    m_start_time = time.perf_counter()
+                    wav = self.bigvgan(latent_chunk.float()).squeeze().unsqueeze(0)
+                    bigvgan_time += time.perf_counter() - m_start_time
+            wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+            wavs.append(wav.cpu())
+
+        end_time = time.perf_counter()
+        self.torch_empty_cache()
+
+        # Final audio assembly
+        self._set_gr_progress(0.9, "save audio...")
+        sampling_rate = 22050
+        crossfade_ms = 150
+        wav = self.crossfade_torch(wavs, crossfade_duration_ms=crossfade_ms, sampling_rate=sampling_rate)
+        wav_length = wav.shape[-1] / sampling_rate
+
+        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+        print(f">> s2mel_time: {s2mel_time:.2f} seconds")
+        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+        print(f">> Total fast inference time: {end_time - start_time:.2f} seconds")
+        print(f">> Generated audio length: {wav_length:.2f} seconds")
+        print(f">> [fast] RTF: {(end_time - start_time) / wav_length:.4f}")
+
+        # Save or return audio
+        if output_path:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            print(">> wav file saved to:", output_path)
+            return output_path
+        else:
+            return (sampling_rate, wav.type(torch.int16).numpy().T)
 
 
 def find_most_similar_cosine(query_vector, matrix):
