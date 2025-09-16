@@ -156,7 +156,8 @@ class UnifiedVoice(nn.Module):
             top_k=30,  # 5, 30
             repetition_penalty=10.0,  # 8.0
             max_tokens=4000,  # 605
-            stop_token_ids=[self.stop_mel_token]
+            stop_token_ids=[self.stop_mel_token],
+            seed=42
         )
 
     def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False):
@@ -553,8 +554,9 @@ class UnifiedVoice(nn.Module):
             duration_emb_half = self.speed_emb(torch.ones_like(tmp).long())
             
             # 合并latents
-            conds_latent = torch.cat((speech_latent_single + emo_vec_single.unsqueeze(1), duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
-            
+            # conds_latent = torch.cat((speech_latent_single + emo_vec_single.unsqueeze(1), duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
+            conds_latent = torch.cat((speech_latent_single + emo_vec_single, duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
+
             # 准备GPT输入，得到inputs_embeds
             # 注意：这里的 `prepare_gpt_inputs` 应该被调整为只返回 `inputs_embeds`
             # 如果它还返回input_ids和attention_mask，我们需要忽略它们
