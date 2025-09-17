@@ -401,17 +401,18 @@ class TextTokenizer:
             assert current_segment_tokens_len <= max_text_tokens_per_segment
             segments.append(current_segment)
         # 如果相邻的句子加起来长度小于最大限制，则合并
-        merged_segments = []
-        for segment in segments:
-            if len(segment) == 0:
-                continue
-            if len(merged_segments) == 0:
-                merged_segments.append(segment)
-            elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment:
-                merged_segments[-1] = merged_segments[-1] + segment
-            else:
-                merged_segments.append(segment)
-        return merged_segments
+        # merged_segments = []
+        # for segment in segments:
+        #     if len(segment) == 0:
+        #         continue
+        #     if len(merged_segments) == 0:
+        #         merged_segments.append(segment)
+        #     elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment:
+        #         merged_segments[-1] = merged_segments[-1] + segment
+        #     else:
+        #         merged_segments.append(segment)
+        # return merged_segments
+        return segments
 
     punctuation_marks_tokens = [
         ".",

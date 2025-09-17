@@ -155,7 +155,7 @@ class UnifiedVoice(nn.Module):
             top_p=0.8,
             top_k=30,  # 5, 30
             repetition_penalty=10.0,  # 8.0
-            max_tokens=4000,  # 605
+            max_tokens=1850,  # 605
             stop_token_ids=[self.stop_mel_token],
             seed=42
         )
@@ -515,12 +515,10 @@ class UnifiedVoice(nn.Module):
         speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1, 2), cond_lengths)
 
         if emo_vec is None:
-            print('计算情感向量')
+            print('compute emo vec')
             emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1, 2), emo_cond_lengths)
             emo_vec = self.emovec_layer(emo_vec)
             emo_vec = self.emo_layer(emo_vec)
-        else:
-            print('使用指定的情感向量')
 
         # --- 2. 设置 VLLM 采样参数 ---
         # 从hf_generate_kwargs转换参数

@@ -13,3 +13,11 @@ nvitop
 modelscope
 accelerate
 descript-audiotools
+pydub
+elasticsearch==8.17
+orjson
+silero_vad
+azure-storage-blob
+langgraph
+beautifulsoup4
+faster_whisper
