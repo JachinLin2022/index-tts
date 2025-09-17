@@ -343,7 +343,7 @@ class TextTokenizer:
 
     @staticmethod
     def split_segments_by_token(
-        tokenized_str: List[str], split_tokens: List[str], max_text_tokens_per_segment: int
+        tokenized_str: List[str], split_tokens: List[str], max_text_tokens_per_segment: int, merge_segments: bool = False
     ) -> List[List[str]]:
         """
         将tokenize后的结果按特定token进一步分割
@@ -401,17 +401,18 @@ class TextTokenizer:
             assert current_segment_tokens_len <= max_text_tokens_per_segment
             segments.append(current_segment)
         # 如果相邻的句子加起来长度小于最大限制，则合并
-        # merged_segments = []
-        # for segment in segments:
-        #     if len(segment) == 0:
-        #         continue
-        #     if len(merged_segments) == 0:
-        #         merged_segments.append(segment)
-        #     elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment:
-        #         merged_segments[-1] = merged_segments[-1] + segment
-        #     else:
-        #         merged_segments.append(segment)
-        # return merged_segments
+        if merge_segments:
+            merged_segments = []
+            for segment in segments:
+                if len(segment) == 0:
+                    continue
+                if len(merged_segments) == 0:
+                    merged_segments.append(segment)
+                elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment:
+                    merged_segments[-1] = merged_segments[-1] + segment
+                else:
+                    merged_segments.append(segment)
+            return merged_segments
         return segments
 
     punctuation_marks_tokens = [
@@ -423,9 +424,9 @@ class TextTokenizer:
         "▁?",
         "▁...", # ellipsis
     ]
-    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120) -> List[List[str]]:
+    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120, merge_segments: bool = False) -> List[List[str]]:
         return TextTokenizer.split_segments_by_token(
-            tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment
+            tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment, merge_segments=merge_segments
         )
 
 
