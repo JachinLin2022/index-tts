@@ -919,7 +919,7 @@ class IndexTTS2:
         # 如果您仍然倾向于使用静音间隔，可以取消注释下面的代码块
         # if interval_silence > 0 and len(wavs) > 1:
             # wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
-        wav = torch.cat(wavs, dim=1) if wavs else torch.tensor([])
+        # wav = torch.cat(wavs, dim=1) if wavs else torch.tensor([])
         # ===========================================================================
 
         if wav.numel() == 0:
