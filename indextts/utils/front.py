@@ -343,7 +343,7 @@ class TextTokenizer:
 
     @staticmethod
     def split_segments_by_token(
-        tokenized_str: List[str], split_tokens: List[str], max_text_tokens_per_segment: int, merge_segments: bool = False
+        tokenized_str: List[str], split_tokens: List[str], max_text_tokens_per_segment: int, merge_segments: bool = True
     ) -> List[List[str]]:
         """
         将tokenize后的结果按特定token进一步分割
@@ -424,7 +424,7 @@ class TextTokenizer:
         "▁?",
         "▁...", # ellipsis
     ]
-    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120, merge_segments: bool = False) -> List[List[str]]:
+    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120, merge_segments: bool = True) -> List[List[str]]:
         return TextTokenizer.split_segments_by_token(
             tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment, merge_segments=merge_segments
         )
