@@ -343,7 +343,7 @@ class TextTokenizer:
 
     @staticmethod
     def split_segments_by_token(
-        tokenized_str: List[str], split_tokens: List[str], max_text_tokens_per_segment: int, merge_segments: bool = True
+        tokenized_str: List[str], split_tokens: List[str], max_text_tokens_per_segment: int, first_handle_num: int = 0
     ) -> List[List[str]]:
         """
         将tokenize后的结果按特定token进一步分割
@@ -401,7 +401,7 @@ class TextTokenizer:
             assert current_segment_tokens_len <= max_text_tokens_per_segment
             segments.append(current_segment)
         # 如果相邻的句子加起来长度小于最大限制，则合并
-        if merge_segments:
+        if not first_handle_num:
             merged_segments = []
             for segment in segments:
                 if len(segment) == 0:
@@ -413,6 +413,19 @@ class TextTokenizer:
                 else:
                     merged_segments.append(segment)
             return merged_segments
+        else:
+            final_segments = []
+            final_segments.append(segments[0])
+            for segment in segments[1:]:
+                if len(segment) == 0:
+                    continue
+                if len(final_segments) <= first_handle_num:
+                    final_segments.append(segment)
+                elif len(final_segments[-1]) + len(segment) <= max_text_tokens_per_segment:
+                    final_segments[-1] = final_segments[-1] + segment
+                else:
+                    final_segments.append(segment)
+            return final_segments
         return segments
 
     punctuation_marks_tokens = [
@@ -424,9 +437,9 @@ class TextTokenizer:
         "▁?",
         "▁...", # ellipsis
     ]
-    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120, merge_segments: bool = True) -> List[List[str]]:
+    def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120, first_handle_num: int = 0) -> List[List[str]]:
         return TextTokenizer.split_segments_by_token(
-            tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment, merge_segments=merge_segments
+            tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment, first_handle_num=first_handle_num
         )
 
 

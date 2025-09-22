@@ -1067,7 +1067,7 @@ class IndexTTS2:
 
         self._set_gr_progress(0.1, "text processing...")
         text_tokens_list = self.tokenizer.tokenize(text)
-        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment, merge_segments=False)
+        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
         if verbose:
             print("text_tokens_list:", text_tokens_list)
             print("segments count:", len(segments))
@@ -1226,6 +1226,317 @@ class IndexTTS2:
             target_segment.export(buffer_mp3, format="mp3", bitrate="64k")
             wav_bytes = buffer_mp3.getvalue()
             yield wav_bytes
+            
+            
+    async def infer_stream_optimized(self, spk_audio_prompt, text, output_path,
+                                    emo_audio_prompt=None, emo_alpha=1.0,
+                                    emo_vector=None,
+                                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+                                    verbose=False, max_text_tokens_per_segment=120, crossfade_ms=400,
+                                    first_handle_num=1,  # 新增参数：优先处理的句子数量
+                                    **generation_kwargs):
+        """
+        [优化版本] 结合了低延迟流式输出和高吞吐量并行处理的推理函数。
+
+        - 优先处理（串行流式）：最开始的 `first_handle_num` 个句子会立刻进行端到端处理并流式返回，以实现最低的初始延迟。
+        - 剩余部分（并行处理）：剩下的所有句子片段会一次性并发提交给VLLM引擎，然后再按顺序依次通过声码器生成并流式返回。
+        """
+        print(">> start optimized inference stream!!!...")
+        self._set_gr_progress(0, "start inference...")
+        if verbose:
+            print(f"origin text:{text}, spk_audio_prompt:{spk_audio_prompt}, "
+                f"emo_audio_prompt:{emo_audio_prompt}, emo_alpha:{emo_alpha}, "
+                f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
+                f"emo_text:{emo_text}, first_handle_num:{first_handle_num}")
+        start_time = time.perf_counter()
+
+        # --- 1. 初始化和条件准备 (与原始代码相同) ---
+        # 这部分代码只执行一次，为所有片段准备共享的条件向量
+        # (代码块与原函数相同，为简洁起见此处省略，实际使用时请从原函数复制)
+        if use_emo_text:
+            emo_audio_prompt = None
+            emo_alpha = 1.0
+            if emo_text is None:
+                emo_text = text
+            emo_dict = self.qwen_emo.inference(emo_text)
+            print(emo_dict)
+            emo_vector = list(emo_dict.values())
+
+        if emo_vector is not None:
+            emo_audio_prompt = None
+            emo_alpha = 1.0
+
+        if emo_audio_prompt is None:
+            emo_audio_prompt = spk_audio_prompt
+            emo_alpha = 1.0
+
+        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+            audio, sr = librosa.load(spk_audio_prompt)
+            audio = torch.tensor(audio).unsqueeze(0)
+            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+            input_features = inputs["input_features"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            spk_cond_emb = self.get_emb(input_features, attention_mask)
+            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device), num_mel_bins=80, dither=0, sample_frequency=16000)
+            feat = feat - feat.mean(dim=0, keepdim=True)
+            style = self.campplus_model(feat.unsqueeze(0))
+            prompt_condition = self.s2mel.models['length_regulator'](S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None)[0]
+            self.cache_spk_cond = spk_cond_emb
+            self.cache_s2mel_style = style
+            self.cache_s2mel_prompt = prompt_condition
+            self.cache_spk_audio_prompt = spk_audio_prompt
+            self.cache_mel = ref_mel
+        else:
+            style = self.cache_s2mel_style
+            prompt_condition = self.cache_s2mel_prompt
+            spk_cond_emb = self.cache_spk_cond
+            ref_mel = self.cache_mel
+
+        if emo_vector is not None:
+            weight_vector = torch.tensor(emo_vector).to(self.device)
+            if use_random:
+                random_index = [random.randint(0, x - 1) for x in self.emo_num]
+            else:
+                random_index = [find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
+            emo_matrix = [tmp[index].unsqueeze(0) for index, tmp in zip(random_index, self.emo_matrix)]
+            emo_matrix = torch.cat(emo_matrix, 0)
+            emovec_mat = weight_vector.unsqueeze(1) * emo_matrix
+            emovec_mat = torch.sum(emovec_mat, 0).unsqueeze(0)
+
+        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+            emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
+            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+            emo_input_features = emo_inputs["input_features"].to(self.device)
+            emo_attention_mask = emo_inputs["attention_mask"].to(self.device)
+            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+            self.cache_emo_cond = emo_cond_emb
+            self.cache_emo_audio_prompt = emo_audio_prompt
+        else:
+            emo_cond_emb = self.cache_emo_cond
+
+        with torch.no_grad(), torch.amp.autocast(self.device, enabled=self.dtype is not None, dtype=self.dtype):
+            emovec = self.gpt.merge_emovec(
+                spk_cond_emb, emo_cond_emb,
+                torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                torch.tensor([emo_cond_emb.shape[-1]], device=self.device),
+                alpha=emo_alpha
+            )
+            if emo_vector is not None:
+                emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
+        
+        # --- 2. 文本分段 ---
+        self._set_gr_progress(0.1, "text processing...")
+        text_tokens_list = self.tokenizer.tokenize(text)
+        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment, first_handle_num=first_handle_num)
+        if verbose:
+            print(f"Text split into {len(segments)} segments.")
+
+        if not segments:
+            print(">> No text segments to process.")
+            return
+
+        # 划分优先处理和并行处理的片段
+        priority_segments = segments[:first_handle_num]
+        parallel_segments = segments[first_handle_num:]
+        
+        last_chunk = None
+        has_warned = False
+        sampling_rate = 22050
+        
+        # --- 3. 阶段一：串行处理优先的句子 ---
+        if verbose:
+            print(f"\n>> Handling {len(priority_segments)} priority segments serially...")
+        for sent_id, sent in enumerate(priority_segments):
+            sent_start_time = time.perf_counter()
+            text_tokens = torch.tensor(self.tokenizer.convert_tokens_to_ids(sent), dtype=torch.int32, device=self.device).unsqueeze(0)
+
+            # 调用 VLLM 获取 codes 和 latent
+            with torch.no_grad(), torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                codes_list, speech_conditioning_latent = await self.gpt.inference_speech_vllm(
+                    spk_cond_emb, text_tokens, emo_cond_emb,
+                    cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
+                    emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                    emo_vec=emovec, num_return_sequences=1
+                )
+                codes = torch.tensor(codes_list, dtype=torch.long, device=self.device)
+            
+            # 后续处理流程（与原 infer_stream 循环内逻辑相同）
+            # ... (此处省略了完整的 vocoder 和音频生成代码，实际使用时请从原 infer_stream 函数复制)
+            # --- Start of copied block ---
+            if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                max_mel_tokens = generation_kwargs.get("max_mel_tokens", 1500)
+                warnings.warn(
+                    f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}).",
+                    category=RuntimeWarning
+                )
+                has_warned = True
+
+            code_len = codes.shape[-1]
+            if self.stop_mel_token in codes[0]:
+                code_len = (codes[0] == self.stop_mel_token).nonzero(as_tuple=False)[0][0].item()
+            codes = codes[:, :code_len]
+            code_lens = torch.tensor([code_len], dtype=torch.long, device=self.device)
+
+            with torch.no_grad(), torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                latent = self.gpt(speech_conditioning_latent, text_tokens, torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
+                                codes, code_lens, emo_cond_emb,
+                                cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
+                                emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                                emo_vec=emovec, use_speed=torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long())
+
+            with torch.no_grad(), torch.amp.autocast(self.device, enabled=self.dtype is not None, dtype=self.dtype):
+                latent = self.s2mel.models['gpt_layer'](latent)
+                S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1)).transpose(1, 2)
+                S_infer = S_infer + latent
+                target_lengths = (code_lens * 1.72).long()
+                cond = self.s2mel.models['length_regulator'](S_infer, ylens=target_lengths, n_quantizers=3, f0=None)[0]
+                cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                vc_target = self.s2mel.models['cfm'].inference(cat_condition, torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                                                            ref_mel, style, None, 20, inference_cfg_rate=0.7)
+                vc_target = vc_target[:, :, ref_mel.size(-1):]
+            
+            with torch.no_grad():
+                wav = self.bigvgan(vc_target.float()).squeeze(1)
+            wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+            # --- End of copied block ---
+
+            print(f"Priority segment {sent_id+1}/{len(priority_segments)} processed in {time.perf_counter() - sent_start_time:.2f}s")
+
+            # 音频拼接与返回
+            buffer_wav = io.BytesIO()
+            torchaudio.save(buffer_wav, wav.cpu().to(torch.int16), sampling_rate, format="wav")
+            audio_segment = AudioSegment.from_wav(buffer_wav)
+            buffer_mp3 = io.BytesIO()
+            if last_chunk is None:
+                # 对于第一块，我们只截取末尾用于下一次拼接的部分
+                target_segment = audio_segment[:-crossfade_ms]
+            else:
+                # 执行交叉淡化
+                fade_out = last_chunk[-crossfade_ms:].fade_out(crossfade_ms)
+                fade_in = audio_segment[:crossfade_ms].fade_in(crossfade_ms)
+                crossfaded_part = fade_out.overlay(fade_in)
+                target_segment = crossfaded_part.append(audio_segment[crossfade_ms:], crossfade=0)
+                # target_segment = last_chunk[-crossfade_ms:].append(audio_segment, crossfade=crossfade_ms)
+                
+
+            last_chunk = audio_segment
+            # target_segment.export(buffer_mp3, format="mp3", bitrate="64k")
+            target_segment.export(buffer_mp3, format="s16le")
+            yield buffer_mp3.getvalue()
+
+
+        # --- 4. 阶段二：并行处理剩余的句子 ---
+        if parallel_segments:
+            if verbose:
+                print(f"\n>> Handling {len(parallel_segments)} remaining segments in parallel at VLLM...")
+            
+            # 准备批处理输入
+            text_tokens_batch = [torch.tensor(self.tokenizer.convert_tokens_to_ids(sent), dtype=torch.int32, device=self.device) for sent in parallel_segments]
+            num_segments = len(parallel_segments)
+            
+            # 扩展条件张量以匹配批次大小
+            batched_spk_cond_emb = spk_cond_emb.repeat(num_segments, 1, 1)
+            batched_emo_cond_emb = emo_cond_emb.repeat(num_segments, 1, 1)
+            batched_emovec = emovec.repeat(num_segments, 1, 1)
+            batched_cond_lengths = torch.tensor([spk_cond_emb.shape[-1]], device=self.device).repeat(num_segments)
+            batched_emo_cond_lengths = torch.tensor([emo_cond_emb.shape[-1]], device=self.device).repeat(num_segments)
+
+            # 并发执行 VLLM 推理
+            vllm_start_time = time.perf_counter()
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.dtype is not None, dtype=self.dtype):
+                all_results, all_latents = await self.gpt.inference_speech_vllm(
+                    batched_spk_cond_emb, text_tokens_batch, batched_emo_cond_emb,
+                    cond_lengths=batched_cond_lengths, emo_cond_lengths=batched_emo_cond_lengths,
+                    emo_vec=batched_emovec, num_return_sequences=1
+                )
+            if verbose:
+                print(f">> VLLM parallel processing took {time.perf_counter() - vllm_start_time:.2f} seconds.")
+
+            # 依次处理 VLLM 的结果，并流式返回音频
+            for i in range(num_segments):
+                sent_start_time = time.perf_counter()
+                codes = torch.tensor(all_results[i], dtype=torch.long, device=self.device).unsqueeze(0)
+                speech_conditioning_latent = all_latents[i:i+1]
+                text_tokens = text_tokens_batch[i].unsqueeze(0)
+                
+                # 后续处理流程（与原 infer_parallel 循环内逻辑相同）
+                # ... (此处省略了完整的 vocoder 和音频生成代码，实际使用时请从原 infer_parallel 函数复制)
+                # --- Start of copied block ---
+                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                    max_mel_tokens = generation_kwargs.get("max_mel_tokens", 1500)
+                    warnings.warn(
+                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}).",
+                        category=RuntimeWarning
+                    )
+                    has_warned = True
+                
+                code_len = codes.shape[-1]
+                if self.stop_mel_token in codes[0]:
+                    code_len = (codes[0] == self.stop_mel_token).nonzero(as_tuple=False)[0][0].item()
+                codes = codes[:, :code_len]
+                code_lens = torch.tensor([code_len], dtype=torch.long, device=self.device)
+
+                current_emo_cond_emb = batched_emo_cond_emb[i:i+1]
+                current_emovec = batched_emovec[i:i+1]
+
+                with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.dtype is not None, dtype=self.dtype):
+                    latent = self.gpt(speech_conditioning_latent, text_tokens, torch.tensor([text_tokens.shape[-1]], device=self.device),
+                                    codes, code_lens, current_emo_cond_emb,
+                                    cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                                    emo_cond_mel_lengths=torch.tensor([current_emo_cond_emb.shape[1]], device=self.device),
+                                    emo_vec=current_emovec.squeeze(1), use_speed=torch.zeros(1, device=self.device).long())
+
+                with torch.no_grad(), torch.amp.autocast(self.device, enabled=self.dtype is not None, dtype=self.dtype):
+                    latent = self.s2mel.models['gpt_layer'](latent)
+                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1)).transpose(1, 2)
+                    S_infer = S_infer + latent
+                    target_lengths = (code_lens * 1.72).long()
+                    cond = self.s2mel.models['length_regulator'](S_infer, ylens=target_lengths, n_quantizers=3, f0=None)[0]
+                    cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                    diffusion_steps = 20
+                    inference_cfg_rate = 0.7
+                    vc_target = self.s2mel.models['cfm'].inference(cat_condition, torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                                                                ref_mel, style, None, diffusion_steps, inference_cfg_rate=inference_cfg_rate)
+                    vc_target = vc_target[:, :, ref_mel.size(-1):]
+
+                with torch.no_grad():
+                    wav = self.bigvgan(vc_target.float()).squeeze(1)
+
+                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                # --- End of copied block ---
+
+                if verbose:
+                    print(f"Parallel segment {i+1}/{num_segments} processed post-VLLM in {time.perf_counter() - sent_start_time:.2f}s")
+                
+                # 音频拼接与返回
+                # audio_segment = AudioSegment.from_wav(io.BytesIO(torchaudio.functional.save_wav(wav.cpu().to(torch.int16), sampling_rate)))
+                m_start_time = time.perf_counter()
+                buffer_wav = io.BytesIO()
+                torchaudio.save(buffer_wav, wav.cpu().to(torch.int16), sampling_rate, format="wav")
+                audio_segment = AudioSegment.from_wav(buffer_wav)
+                buffer_mp3 = io.BytesIO()
+                print("save wav time", time.perf_counter() - m_start_time)
+                if last_chunk is None:
+                    target_segment = audio_segment
+                else:
+                    fade_out = last_chunk[-crossfade_ms:].fade_out(crossfade_ms)
+                    fade_in = audio_segment[:crossfade_ms].fade_in(crossfade_ms)
+                    crossfaded_part = fade_out.overlay(fade_in)
+                    target_segment = crossfaded_part.append(audio_segment[crossfade_ms:], crossfade=0)
+                    # target_segment = last_chunk[-crossfade_ms:].append(audio_segment, crossfade=crossfade_ms)
+
+                last_chunk = audio_segment
+                # target_segment.export(buffer_mp3, format="mp3", bitrate="64k")
+                target_segment.export(buffer_mp3, format="s16le")
+                print("save mp3 time", time.perf_counter() - m_start_time)
+                yield buffer_mp3.getvalue()
+
+        print(f"\n>> Total inference time: {time.perf_counter() - start_time:.2f} seconds")
 
 def find_most_similar_cosine(query_vector, matrix):
     query_vector = query_vector.float()
