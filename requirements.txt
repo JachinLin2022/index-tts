@@ -21,3 +21,4 @@ azure-storage-blob
 langgraph
 beautifulsoup4
 faster_whisper
+noisereduce

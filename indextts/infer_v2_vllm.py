@@ -1411,6 +1411,9 @@ class IndexTTS2:
             buffer_wav = io.BytesIO()
             torchaudio.save(buffer_wav, wav.cpu().to(torch.int16), sampling_rate, format="wav")
             audio_segment = AudioSegment.from_wav(buffer_wav)
+            
+            if interval_silence > 0:
+                audio_segment += AudioSegment.silent(duration=interval_silence, frame_rate=sampling_rate)
             buffer_mp3 = io.BytesIO()
             if last_chunk is None:
                 # 对于第一块，我们只截取末尾用于下一次拼接的部分
@@ -1519,6 +1522,8 @@ class IndexTTS2:
                 buffer_wav = io.BytesIO()
                 torchaudio.save(buffer_wav, wav.cpu().to(torch.int16), sampling_rate, format="wav")
                 audio_segment = AudioSegment.from_wav(buffer_wav)
+                if interval_silence > 0:
+                    audio_segment += AudioSegment.silent(duration=interval_silence, frame_rate=sampling_rate)
                 buffer_mp3 = io.BytesIO()
                 print("save wav time", time.perf_counter() - m_start_time)
                 if last_chunk is None:
