@@ -39,6 +39,7 @@ from typing import List, Dict
 import numpy as np
 import io
 from pydub import AudioSegment
+from vllm import SamplingParams
 
 
 def set_all_random_seeds(seed: int = 42):
@@ -1348,6 +1349,17 @@ class IndexTTS2:
         has_warned = False
         sampling_rate = 22050
         
+        sampling_params = SamplingParams(
+            temperature=generation_kwargs.get("temperature", 0.8),
+            top_p=generation_kwargs.get("top_p", 0.8),
+            top_k=generation_kwargs.get("top_k", 30),  # 5, 30
+            repetition_penalty=generation_kwargs.get("repetition_penalty", 10.0),  # 8.0
+            max_tokens=generation_kwargs.get("max_tokens", 1850),  # 605
+            stop_token_ids=[self.stop_mel_token],
+            seed=generation_kwargs.get("seed", 42)
+        )
+        print(f"sampling_params: {sampling_params}")
+        
         # --- 3. 阶段一：串行处理优先的句子 ---
         if verbose:
             print(f"\n>> Handling {len(priority_segments)} priority segments serially...")
@@ -1361,7 +1373,7 @@ class IndexTTS2:
                     spk_cond_emb, text_tokens, emo_cond_emb,
                     cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                     emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                    emo_vec=emovec, num_return_sequences=1
+                    emo_vec=emovec, num_return_sequences=1, sampling_params=sampling_params
                 )
                 codes = torch.tensor(codes_list, dtype=torch.long, device=self.device)
             
@@ -1455,7 +1467,7 @@ class IndexTTS2:
                 all_results, all_latents = await self.gpt.inference_speech_vllm(
                     batched_spk_cond_emb, text_tokens_batch, batched_emo_cond_emb,
                     cond_lengths=batched_cond_lengths, emo_cond_lengths=batched_emo_cond_lengths,
-                    emo_vec=batched_emovec, num_return_sequences=1
+                    emo_vec=batched_emovec, num_return_sequences=1, sampling_params=sampling_params
                 )
             if verbose:
                 print(f">> VLLM parallel processing took {time.perf_counter() - vllm_start_time:.2f} seconds.")

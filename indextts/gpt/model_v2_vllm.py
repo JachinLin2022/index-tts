@@ -151,7 +151,7 @@ class UnifiedVoice(nn.Module):
         )
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
         self.sampling_params = SamplingParams(
-            temperature=1.0,
+            temperature=0.8,
             top_p=0.8,
             top_k=30,  # 5, 30
             repetition_penalty=10.0,  # 8.0
@@ -485,7 +485,7 @@ class UnifiedVoice(nn.Module):
         return output, speech_conditioning_latent
 
     async def inference_speech_vllm(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, num_return_sequences=1,
-                                 typical_sampling=False):
+                                 typical_sampling=False, sampling_params=None):
         """
         使用 VLLM 加速的推理函数。
 
@@ -541,7 +541,7 @@ class UnifiedVoice(nn.Module):
 
 
         # --- 3. 定义单个请求的生成函数 ---
-        async def _generate_one(text_input_tensor, speech_latent_single, emo_vec_single):
+        async def _generate_one(text_input_tensor, speech_latent_single, emo_vec_single, sampling_params):
             # 将输入张量调整为batch size为1的形状
             if text_input_tensor.ndim == 1:
                 text_input_tensor = text_input_tensor.unsqueeze(0)
@@ -568,7 +568,9 @@ class UnifiedVoice(nn.Module):
 
             # --- c. 生成输出 ---
             request_id = f"req-{uuid.uuid4()}"
-            output_generator = self.llm.generate(tokens_prompt, self.sampling_params, request_id)
+            if sampling_params is None:
+                sampling_params = self.sampling_params
+            output_generator = self.llm.generate(tokens_prompt, sampling_params, request_id)
             
             final_output = None
             async for output in output_generator:
@@ -591,7 +593,7 @@ class UnifiedVoice(nn.Module):
              # 每个任务获取其对应的latent切片
             speech_latent_slice = speech_conditioning_latent[i:i+1]
             emo_vec_slice = emo_vec[i:i+1]
-            tasks.append(_generate_one(text_tensor, speech_latent_slice, emo_vec_slice))
+            tasks.append(_generate_one(text_tensor, speech_latent_slice, emo_vec_slice, sampling_params))
         
         # 并发执行并等待所有任务完成
         all_outputs = await asyncio.gather(*tasks)
